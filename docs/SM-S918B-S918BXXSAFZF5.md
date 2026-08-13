@@ -60,10 +60,14 @@ target.
 
 ## Test payload status
 
-The tracked artifacts from the earlier PR #196 experiment do not contain this
-recovered route. Do not use their old hashes to test the code described here.
-Build a fresh payload from this branch and record its SHA-256 with the log. No
-new generated artifact is included by this source change.
+The tracked artifacts now contain the recovered closed route. The canonical payload uses SIGRETURN, matching the recovered production engine. MCAST is kept as a separate comparison backend.
+
+| Backend | File | SHA-256 | Size |
+| --- | --- | --- | --- |
+| SIGRETURN | `artifacts/dm3q-S918BXXSAFZF5/cve-2026-43499-app.so` | `558f051c657c484b5bdf4933ccfabb8be29a85a38fb7d02d46c32903f2d15cdf` | 104128 |
+| MCAST | `artifacts/dm3q-S918BXXSAFZF5/cve-2026-43499-app-mcast.so` | `796324701dad319db9b2c1ec08b77909b42ccde251664d6a256a1fa9e805e4e7` | 104128 |
+
+Always record the exact payload SHA-256 with each hardware log. These files are experimental test candidates, not a released support-feed entry.
 
 ## Build the recovered route
 
