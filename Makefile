@@ -3,7 +3,7 @@ TARGET ?= pa3q-S938NKSUACZF1
 OUTDIR ?= build/$(TARGET)
 
 ifeq ($(TARGET),dm3q-S918BXXSAFZF5)
-STACK_WRITER ?= mcast
+STACK_WRITER ?= sigreturn
 ifeq ($(STACK_WRITER),mcast)
 APP_STACK_WRITER_CFLAG := -DSLIDE_STACK_WRITER=1
 else ifeq ($(STACK_WRITER),sigreturn)

